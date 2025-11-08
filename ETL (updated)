@@ -1,0 +1,120 @@
+/*
+==================================================================================
+-- CREATE FINAL 'LoanData' TABLE FOR POWER BI -- (MASTER CORRECTED VERSION)
+This script does the following:
+1.  De-duplicates both finance1 and finance2 tables using ROW_NUMBER().
+2.  JOINS the two clean tables together on 'id'.
+3.  Cleans and transforms every column (text, dates, numbers).
+4.  Correctly handles NULLs in 'emp_length' to distinguish them from 0.
+5.  Inserts the final, clean data into a new table called [LoanData].
+==================================================================================
+*/
+
+-- Check if the [LoanData] table already exists, and if so, drop it.
+-- This allows you to re-run the script without errors.
+IF OBJECT_ID('LoanData', 'U') IS NOT NULL
+    DROP TABLE LoanData;
+GO
+
+-- Use a Common Table Expression (CTE) to de-duplicate finance1
+WITH finance1_deduped AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER(PARTITION BY id ORDER BY issue_d DESC) AS rn -- Get the most recent record per ID
+    FROM
+        [finance1]
+),
+-- Use a CTE to de-duplicate finance2
+finance2_deduped AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER(PARTITION BY id ORDER BY last_pymnt_d DESC) AS rn -- Get the most recent record per ID
+    FROM
+        [finance2]
+)
+-- Main SELECT statement to clean, transform, and create the new table
+SELECT
+    -- === Cleaned Columns from finance1 ===
+    f1.id,
+    f1.member_id,
+
+    -- Convert money columns to DECIMAL for accuracy
+    TRY_CONVERT(DECIMAL(18, 2), f1.loan_amnt) AS loan_amnt,
+    TRY_CONVERT(DECIMAL(18, 2), f1.funded_amnt) AS funded_amnt,
+    TRY_CONVERT(DECIMAL(18, 2), f1.funded_amnt_inv) AS funded_amnt_inv,
+
+    -- Clean 'term' column: " 36 months" -> 36
+    TRY_CONVERT(INT, LTRIM(RTRIM(REPLACE(f1.term, 'months', '')))) AS term_months,
+
+    -- Convert rate to a precise number
+    TRY_CONVERT(DECIMAL(10, 4), f1.int_rate) AS int_rate,
+    TRY_CONVERT(DECIMAL(18, 2), f1.installment) AS installment,
+
+    -- Trim text columns and handle NULLs
+    LTRIM(RTRIM(f1.grade)) AS grade,
+    LTRIM(RTRIM(f1.sub_grade)) AS sub_grade,
+    ISNULL(LTRIM(RTRIM(f1.emp_title)), 'Unknown') AS emp_title,
+
+    -- *** CORRECTED emp_length CASE STATEMENT ***
+    CASE LTRIM(RTRIM(f1.emp_length))
+        WHEN '10+ years' THEN 10
+        WHEN '9 years' THEN 9
+        WHEN '8 years' THEN 8
+        WHEN '7 years' THEN 7
+        WHEN '6 years' THEN 6
+        WHEN '5 years' THEN 5
+        WHEN '4 years' THEN 4
+        WHEN '3 years' THEN 3
+        WHEN '2 years' THEN 2
+        WHEN '1 year' THEN 1
+        WHEN '< 1 year' THEN 0   -- This is a valid value
+        ELSE NULL -- All other values (NULL, 'n/a', etc.) are treated as missing
+    END AS emp_length_years,
+
+    ISNULL(LTRIM(RTRIM(f1.home_ownership)), 'Other') AS home_ownership,
+    TRY_CONVERT(DECIMAL(18, 2), f1.annual_inc) AS annual_inc,
+    LTRIM(RTRIM(f1.verification_status)) AS verification_status,
+
+    -- Convert text dates to real DATE type (Style 103 = dd/mm/yyyy)
+    TRY_CONVERT(DATE, f1.issue_d, 103) AS issue_date,
+
+    LTRIM(RTRIM(f1.loan_status)) AS loan_status,
+    ISNULL(LTRIM(RTRIM(f1.purpose)), 'Unknown') AS purpose,
+    ISNULL(LTRIM(RTRIM(f1.title)), 'Unknown') AS title,
+    LTRIM(RTRIM(f1.zip_code)) AS zip_code,
+    LTRIM(RTRIM(f1.addr_state)) AS addr_state,
+    TRY_CONVERT(DECIMAL(10, 2), f1.dti) AS dti,
+
+    -- === Cleaned Columns from finance2 ===
+    TRY_CONVERT(DATE, f2.earliest_cr_line, 103) AS earliest_cr_line_date,
+
+    -- Handle NULLs in "months since" columns. 0 means "Not Applicable"
+    ISNULL(TRY_CONVERT(INT, f2.mths_since_last_delinq), 0) AS mths_since_last_delinq,
+    ISNULL(TRY_CONVERT(INT, f2.mths_since_last_record), 0) AS mths_since_last_record,
+
+    TRY_CONVERT(INT, f2.open_acc) AS open_acc,
+    TRY_CONVERT(INT, f2.pub_rec) AS pub_rec,
+    TRY_CONVERT(DECIMAL(18, 2), f2.revol_bal) AS revol_bal,
+    TRY_CONVERT(DECIMAL(10, 4), f2.revol_util) AS revol_util,
+    TRY_CONVERT(INT, f2.total_acc) AS total_acc,
+    TRY_CONVERT(DECIMAL(18, 2), f2.total_pymnt) AS total_pymnt,
+    TRY_CONVERT(DECIMAL(18, 2), f2.total_rec_prncp) AS total_rec_prncp,
+    TRY_CONVERT(DECIMAL(18, 2), f2.total_rec_int) AS total_rec_int,
+    TRY_CONVERT(DECIMAL(18, 2), f2.recoveries) AS recoveries,
+    TRY_CONVERT(DECIMAL(18, 2), f2.collection_recovery_fee) AS collection_recovery_fee,
+    TRY_CONVERT(DECIMAL(18, 2), f2.last_pymnt_amnt) AS last_pymnt_amnt,
+
+    -- Convert more dates. NULLs will be preserved.
+    TRY_CONVERT(DATE, f2.last_pymnt_d, 103) AS last_pymnt_date,
+    TRY_CONVERT(DATE, f2.last_credit_pull_d, 103) AS last_credit_pull_date
+
+INTO
+    [LoanData] -- This is the name of your new, clean table
+FROM
+    finance1_deduped AS f1
+    
+-- Use LEFT JOIN to ensure we keep all records from finance1
+LEFT JOIN
+    finance2_deduped AS f2 ON f1.id = f2.id AND f2.rn = 1 -- Join on the de-duped f2
+WHERE
+    f1.rn = 1; -- This is the filter that removes duplicates from finance1
